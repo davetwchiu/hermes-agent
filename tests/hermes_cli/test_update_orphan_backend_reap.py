@@ -276,6 +276,8 @@ def _run_guard(detect_side_effect, orphan_return):
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
     ), patch(
+        "hermes_cli.guardian.in_place_update_refusal", return_value=None
+    ), patch(
         "time.sleep"
     ):
         try:

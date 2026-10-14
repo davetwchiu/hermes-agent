@@ -219,6 +219,8 @@ def _run_update_until_guard(args):
         cli_main, "_orphaned_desktop_backend_pids", return_value=None
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
+    ), patch(
+        "hermes_cli.guardian.in_place_update_refusal", return_value=None
     ):
         try:
             update_cmd._cmd_update_impl(args, gateway_mode=False)
