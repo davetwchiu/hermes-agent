@@ -14,6 +14,13 @@ The stage-by-stage contract (`plan → snapshot → apply → restart-per-kind �
 field failure each stage guards are documented in `hermes_cli/AGENTS.md`; user-facing behaviour
 (receipts, `--plan`, snapshot modes) is in [Updating](../getting-started/updating.md).
 
+Hermes Guardian refuses `hermes update` before any update-side effect when its source root resolves to
+David's live editable Hermes checkout. The updater mutates its checkout in place and has no immutable
+staging-and-activation path, so this guard blocks activation instead of treating a clean branch or
+merged PR as a release. A local Codex `PreToolUse` hook also blocks supported tool calls that target
+that checkout. Hooks do not cover arbitrary shell sessions or cloud/remote Work; the GitHub Guardian
+check enforces PR source identity and a documented impact assessment without checking out PR code.
+
 The systemd blunt-restart fallback waits for the unit's `TimeoutStopUSec` plus
 `TimeoutStartUSec`, with 15 seconds of client-side slack. It reads the target unit
 in the same manager scope as the restart; both the initial attempt and retry use

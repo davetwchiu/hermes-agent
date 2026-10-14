@@ -1,0 +1,34 @@
+name: Hermes Guardian
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guardian:
+    name: Hermes Guardian
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # pull_request_target is safe here because this checks out only the trusted base commit.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: hermes_cli/guardian.py
+          sparse-checkout-cone-mode: false
+
+      - name: Read the PR file list from GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          FILES_JSON: ${{ runner.temp }}/hermes-guardian-files.json
+        run: gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" > "${FILES_JSON}"
+
+      - name: Verify source-control identity and documentation impact
+        run: python3 hermes_cli/guardian.py --check-pr "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/hermes-guardian-files.json"
