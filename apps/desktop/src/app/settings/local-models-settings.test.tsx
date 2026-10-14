@@ -478,7 +478,7 @@ describe('quickstart', () => {
   })
 
   it('pins the quickstart progress view while the job runs', async () => {
-    $localRuntimeJobs.set([
+    const jobs: LocalRuntimeJob[] = [
       {
         job_id: 'q1',
         kind: 'quickstart',
@@ -492,7 +492,9 @@ describe('quickstart', () => {
         percent: 30,
         error: null
       }
-    ])
+    ]
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs })
+    $localRuntimeJobs.set(jobs)
     renderPane()
 
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()
