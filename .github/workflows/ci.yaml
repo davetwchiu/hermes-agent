@@ -215,8 +215,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Failures and cancellations
+  # fail the gate; ``skipped`` is treated as success.
   #
   # Branch protection should require ONLY this check.
   #
@@ -271,7 +271,7 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          failed = [name for name, info in needs.items() if info['result'] in ('failure', 'cancelled')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
