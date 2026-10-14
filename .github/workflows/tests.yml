@@ -17,7 +17,8 @@ jobs:
     # Run the full suite on the standard public runner; the test runner
     # isolates files and controls its worker count.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The 4-worker run reached 83% at 60 minutes on ubuntu-latest.
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
