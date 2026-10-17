@@ -36,6 +36,16 @@ Fixes #
 2. 
 3. 
 
+## Documentation impact
+
+<!-- Required: list every changed Markdown file, or explain why no documentation changed and cite an added line as `path/file.py#L123`. -->
+
+Updated: `path/to/file.md`
+
+<!-- If no Markdown change is needed, replace the line above with:
+No update: <specific reason>. Evidence: `path/to/changed-file.py#L123`
+-->
+
 ## Checklist
 
 <!-- Complete these before requesting review. -->
