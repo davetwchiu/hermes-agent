@@ -289,6 +289,12 @@ unattended ones: a cron job, `hermes chat -q` run or webhook session under
 detected rule key is in `command_allowlist`, while Tirith content-security
 findings on the same command continue to block it.
 
+For profiles that can run Cron, avoid permanently allowing broad inline-code
+rule keys such as `script execution via -e/-c flag` or `script execution via
+heredoc`: a matching permanent approval overrides `cron_mode: deny` for that
+pattern on every unattended run in the profile. Put unattended code in a fixed,
+reviewed script and remove the broad rule key to restore Cron denial.
+
 The setting must be a list of strings. Legacy installs that stored a list as a
 quoted YAML/JSON string recover that list at load time and log a warning to
 re-save it with `hermes config edit`. Other malformed values are ignored with
