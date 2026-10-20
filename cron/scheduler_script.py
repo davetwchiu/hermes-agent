@@ -20,6 +20,7 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from cron.script_paths import is_allowed_cron_script
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -255,9 +256,8 @@ def _windows_cron_bootstrap_argv(
 
 
 def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str]]:
-    """Validate a job script path; ``(path, None)`` or ``(None, error)``. Scripts MUST resolve
-    inside HERMES_HOME/scripts/ (relative, absolute and ``~`` paths are all validated — path
-    traversal / absolute-path injection); contract of lifecycle_guard._expand_candidate_path."""
+    """Validate a job script path; ``(path, None)`` or ``(None, error)``. Profile scripts stay
+    inside HERMES_HOME/scripts/; only the active immutable release's scripts/gooaye is shared."""
     scripts_dir = _sched._get_hermes_home() / "scripts"
     _ensure_cron_dir(scripts_dir)
     scripts_dir_resolved = scripts_dir.resolve()
@@ -279,13 +279,11 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
         return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
     path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
 
-    # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # Traversal and symlink escapes remain blocked outside the one tracked release directory.
+    if not is_allowed_cron_script(path, scripts_dir_resolved):
         return None, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+            f"Blocked: script path resolves outside the scripts directory and active immutable "
+            f"Gooaye release ({scripts_dir_resolved}): {script_path!r}"
         )
     if not path.exists():
         # Scripts resolve against THIS profile's scripts/ dir by design (profiles never share files),
@@ -330,7 +328,8 @@ def _run_job_script(
     ``os.chdir()`` would leak into concurrent gateway sessions).
 
     Args: script_path: Path to the script. Relative paths are resolved against HERMES_HOME/scripts/.
-    Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
+    Absolute and ~-prefixed paths are validated against that directory or the active immutable
+    release's scripts/gooaye directory. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """

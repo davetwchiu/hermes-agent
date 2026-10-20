@@ -524,7 +524,7 @@ Checks per active job:
 - `next_run_at` missing, or parked in the past beyond a 15-minute ticker
   grace window — the "job is silently not firing" signal (scheduler dead,
   gateway down, or a wedged fire-claim),
-- script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
+- script missing, not a file, or resolving outside `HERMES_HOME/scripts` and the active immutable release's `scripts/gooaye/`,
 - `no_agent` job with no script,
 - configured `workdir` that no longer exists.
 
@@ -897,7 +897,7 @@ Semantics:
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 
-`.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must resolve inside `$HERMES_HOME/scripts/` — relative names, absolute paths, and `~`-prefixed paths are accepted when the resolved target stays in that directory; paths that escape it are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
+`.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Relative scripts must resolve inside `$HERMES_HOME/scripts/`. Absolute paths are also allowed only when they resolve inside the active full-SHA immutable release's `scripts/gooaye/` directory; other absolute paths, stale releases, and symlink escapes are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
 
 #### Giving a script a credential
 
