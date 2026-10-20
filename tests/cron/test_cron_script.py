@@ -592,6 +592,55 @@ class TestScriptPathContainment:
         assert success is True
         assert output == "sub ok"
 
+    def test_active_immutable_gooaye_release_script_runs(self, cron_env):
+        from cron.scheduler_script import _run_job_script
+
+        release = cron_env / "deployments" / f"hermes-agent-{'a' * 40}"
+        script = release / "scripts" / "gooaye" / "monitor.py"
+        script.parent.mkdir(parents=True)
+        script.write_text('print("release")\n')
+        (cron_env / "current").symlink_to(release, target_is_directory=True)
+
+        path = cron_env / "current" / "scripts" / "gooaye" / "monitor.py"
+        success, output = _run_job_script(str(path))
+        assert success is True
+        assert output == "release"
+
+    def test_stale_immutable_release_script_is_blocked(self, cron_env):
+        from cron.scheduler_script import _run_job_script
+
+        active = cron_env / "deployments" / f"hermes-agent-{'a' * 40}"
+        stale = cron_env / "deployments" / f"hermes-agent-{'b' * 40}"
+        active.mkdir(parents=True)
+        script = stale / "scripts" / "gooaye" / "monitor.py"
+        script.parent.mkdir(parents=True)
+        script.write_text('print("stale")\n')
+        (cron_env / "current").symlink_to(active, target_is_directory=True)
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "blocked" in output.lower()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Symlinks require elevated privileges on Windows",
+    )
+    def test_active_release_script_symlink_escape_is_blocked(self, cron_env, tmp_path):
+        from cron.scheduler_script import _run_job_script
+
+        release = cron_env / "deployments" / f"hermes-agent-{'a' * 40}"
+        script_dir = release / "scripts" / "gooaye"
+        script_dir.mkdir(parents=True)
+        outside = tmp_path / "outside.py"
+        outside.write_text('print("escaped")\n')
+        (script_dir / "escape.py").symlink_to(outside)
+        (cron_env / "current").symlink_to(release, target_is_directory=True)
+
+        path = cron_env / "current" / "scripts" / "gooaye" / "escape.py"
+        success, output = _run_job_script(str(path))
+        assert success is False
+        assert "blocked" in output.lower()
+
 
     @pytest.mark.skipif(
         sys.platform == "win32",

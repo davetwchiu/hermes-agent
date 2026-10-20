@@ -1,0 +1,28 @@
+{
+  "python": {
+    "implementation": "CPython",
+    "version": "3.11.15",
+    "uv_lock_sha256": "b9c587446a3b1409d33e77563f600f0e22ef3bf2447476acf000496423d81761"
+  },
+  "executables": {
+    "node": {
+      "version": "v22.23.2",
+      "sha256": "18e387c90ab8a8400183e8bdd396376e1e875b91b4c874b894dcade7b35bf572"
+    },
+    "ffmpeg": {
+      "version": "8.0.1",
+      "sha256": "0a96da2735695308d964e25fa6f4a0db2e9d24031390360f4c5ff96a4f8938e5"
+    },
+    "ffprobe": {
+      "version": "8.0.1",
+      "sha256": "68447e67105534f3f43b95c94983ed56fbdd7125e5724cc56499ad538c2b86a7"
+    }
+  },
+  "vault_helper": {
+    "source_repository": "davetwchiu/david-knowledge-vault",
+    "source_commit": "32b5b5e81f9ea2018123ceafc11fb6712d067e43",
+    "source_path": ".github/scripts/vault_curation_reconcile.cjs",
+    "git_blob_sha": "9171c69ec84e36e68dc4502f259a4e23594ed110",
+    "sha256": "19fe112d04adff3d1bd1fa6706c0ecee98ee9134def683d1b702d71c099de375"
+  }
+}

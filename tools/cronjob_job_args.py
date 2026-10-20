@@ -4,9 +4,11 @@ tools/cronjob_tools.py)."""
 import contextlib
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from cron.jobs import effective_job_state
+from cron.script_paths import is_active_gooaye_release_script
 
 import hermes_time
 
@@ -363,25 +365,28 @@ def _validate_cron_base_url(
 
 
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
-    """Scripts must be relative paths within HERMES_HOME/scripts/ (absolute / ~ / drive-letter
-    rejected — prompt-injection guard). Error string if blocked, else None; empty = clear."""
+    """Keep profile scripts relative; permit absolute paths only in the active immutable Gooaye release."""
     if not script or not script.strip():
         return None
 
     from hermes_constants import get_hermes_home
     raw = script.strip()
     scripts_dir = get_hermes_home() / "scripts"
-    if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
-        return (
-            f"Script path must be relative to {scripts_dir}/. "
-            f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in {scripts_dir}/ and use just the filename.")
-
-    from tools.path_security import validate_within_dir
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    resolved_script = scripts_dir / raw
-    if validate_within_dir(resolved_script, scripts_dir):
-        return f"Script path escapes the scripts directory via traversal: {raw!r}"
+    is_absolute = raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":")
+    try:
+        resolved_script = Path(raw).expanduser().resolve() if is_absolute else (scripts_dir / raw).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return f"Script path is not a valid filesystem path: {raw!r}"
+    if is_absolute:
+        if not is_active_gooaye_release_script(resolved_script):
+            return (
+                f"Script path must be relative to {scripts_dir}/ or inside the active immutable "
+                f"Hermes release's scripts/gooaye/. Got absolute or home-relative path: {raw!r}.")
+    else:
+        from tools.path_security import validate_within_dir
+        if validate_within_dir(resolved_script, scripts_dir):
+            return f"Script path escapes the scripts directory via traversal: {raw!r}"
     if not resolved_script.is_file():
         return (
             f"Script file not found: {resolved_script}. "

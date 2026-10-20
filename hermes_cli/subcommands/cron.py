@@ -39,7 +39,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument("--skill", dest="skills", action="append",
         help="Attach a skill. Repeat to add multiple skills.")
     cron_create.add_argument("--script",
-        help="Path to a script under ~/.hermes/scripts/. Default mode: "
+        help="Path under ~/.hermes/scripts/ or the active immutable release's scripts/gooaye/. Default mode: "
             "script stdout is injected into the agent's prompt each run. "
             "With --no-agent: the script IS the job and its stdout is "
             "delivered verbatim. .sh/.bash files run via bash, everything "
@@ -49,8 +49,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings).")
     cron_create.add_argument("--monitor-script", dest="monitor_script",
-        help="Monitor mode: path to a cheap source script under "
-            "~/.hermes/scripts/ that runs each tick BEFORE the agent. "
+        help="Monitor mode: path to a cheap source script under ~/.hermes/scripts/ or the active "
+            "immutable release's scripts/gooaye/ that runs each tick BEFORE the agent. "
             "Unchanged output (exact-bytes hash) suppresses the agent run "
             "entirely; changed output injects a MONITOR CHANGE DETECTED "
             "diff into the prompt. Script output must be stable (no "
@@ -106,7 +106,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Remove a specific attached skill. Repeatable.")
     _flag(cron_edit, "--clear-skills", help="Remove all attached skills from the job")
     cron_edit.add_argument("--script",
-        help="Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
+        help="Path under ~/.hermes/scripts/ or the active immutable release's scripts/gooaye/. "
+            "Pass empty string to clear. "
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run.")
     cron_edit.add_argument(
@@ -123,7 +124,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help=("Turn off run-to-run continuity (other context_from job refs are preserved)."))
     cron_edit.add_argument("--monitor-script", dest="monitor_script",
         help="Set/replace the monitor source script (see `hermes cron create "
-            "--monitor-script`). Pass empty string to clear.")
+            "--monitor-script`). Active immutable release paths are accepted for Gooaye scripts. "
+            "Pass empty string to clear.")
     cron_edit.add_argument("--monitor-url", dest="monitor_url",
         help=("Set/replace the monitor source URL. Pass empty string to clear."))
     cron_edit.add_argument("--workdir",
