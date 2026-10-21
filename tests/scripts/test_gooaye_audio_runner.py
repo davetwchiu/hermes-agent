@@ -524,6 +524,21 @@ def test_cycle_cli_entrypoint_invokes_shared_cycle(monkeypatch, capsys):
     assert '"status": "cycle_complete"' in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("result,expected", [
+    ({"status": "cycle_attention", "results": [{"status": "outcome_unknown"}],
+      "audio_attention": []}, 0),
+    ({"status": "cycle_attention", "results": [{"status": "blocked"}],
+      "audio_attention": []}, 1),
+    ({"status": "cycle_attention", "results": [],
+      "audio_attention": [{"status": "review_required"}]}, 1),
+])
+def test_cycle_cli_exits_cleanly_for_reconcilable_states(monkeypatch, result, expected):
+    monkeypatch.setattr(runner, "run_cycle", lambda **kwargs: result)
+    monkeypatch.setattr(runner.sys, "argv", ["gooaye_audio_first.py", "cycle"])
+
+    assert runner.main() == expected
+
+
 def completed_audio_fixture(state_path, number):
     now = datetime.now(timezone.utc)
     ledger.observe_messages([{"id": str(6400 + int(number)), "datetime": now.isoformat(),
