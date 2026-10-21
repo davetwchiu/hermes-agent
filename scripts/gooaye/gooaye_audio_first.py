@@ -1715,7 +1715,11 @@ def main() -> int:
                 raise AudioIssue("--max-chunks must be a positive integer")
             result = run_cycle(max_chunks=args.max_chunks)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            return 1 if result.get("status") in {"cycle_attention", "failed"} else 0
+            hard_failure = result.get("status") == "failed" or bool(result.get("audio_attention")) or any(
+                item.get("status") in {"blocked", "failed", "review_required"}
+                for item in result.get("results", [])
+            )
+            return 1 if hard_failure else 0
         if args.command == "run":
             if args.max_chunks is not None and args.max_chunks < 1:
                 raise AudioIssue("--max-chunks must be a positive integer")
