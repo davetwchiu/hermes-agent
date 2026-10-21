@@ -108,6 +108,29 @@ def setup_episode(path, episode):
     return metadata
 
 
+@pytest.mark.parametrize("terminal_status,notice_status", [
+    ("pending", "pending"),
+    ("running", "completed"),
+    ("outcome_unknown", "completed"),
+    ("completed", "completed"),
+])
+def test_legacy_workflow_migration_avoids_repeating_old_terminal_brief(terminal_status, notice_status):
+    metadata = {
+        "episode_number": "EP710", "rss_guid": "guid-710",
+        "enclosure_url": "https://rss.soundon.fm/710.mp3", "telegram_post_id": "7110",
+    }
+    legacy = contract.new_state(metadata)
+    legacy["schema_version"] = 1
+    legacy["stages"].pop("transcript_notice")
+    legacy["stages"]["terminal_delivery"]["status"] = terminal_status
+
+    migrated = contract.normalize_state(legacy)
+
+    assert migrated["schema_version"] == 2
+    assert migrated["stages"]["transcript_notice"]["status"] == notice_status
+    assert "transcript_notice" not in legacy["stages"]
+
+
 def test_runner_advances_all_shared_stages_per_episode_and_is_idempotent(tmp_path):
     state_path = tmp_path / "episodes.json"
     adapters = {stage: Adapter() for stage in STAGES}
@@ -135,7 +158,8 @@ def test_production_brief_adapter_receives_source_metadata_from_shared_runner(tm
     brief_adapter = runner.production_stage_adapters()["transcript_brief"]
 
     result = runner.run_shared_stages(
-        "710", metadata, {"transcript_brief": brief_adapter}, state_path=state_path)
+        "710", metadata, {"transcript_brief": brief_adapter,
+                          "transcript_notice": Adapter()}, state_path=state_path)
 
     assert result["status"] == "blocked"
     assert result["stage"] == "publication"
@@ -184,6 +208,9 @@ def test_production_publication_reconciliation_preserves_exact_handoff_fields(tm
         "brief_provenance": {"kind": "edited_brief", "text": "brief 711",
                               "source_transcript_sha256": "a" * 64},
     }
+    workflow = contract.start_stage(workflow, "transcript_notice", "notice-op-711")
+    workflow = contract.complete_stage(workflow, "transcript_notice", artifact_hash="notice-hash-711",
+                                      external_id="notice-op-711")
     workflow = contract.start_stage(
         workflow, "publication", "publication-op-711", operation_id="publication-op-711")
     workflow = contract.mark_outcome_unknown(workflow, "publication")
@@ -376,6 +403,7 @@ def test_known_pending_trusted_receipt_keeps_typed_blocker_evidence(tmp_path, mo
         "ingestion_identity": "vault-ingest:" + "h" * 40,
     }
     for stage, result in (("transcript_brief", {"artifact_hash": "a" * 64}),
+                          ("transcript_notice", {"artifact_hash": "a" * 64}),
                           ("publication", publication),
                           ("dispatch", {"artifact_hash": "c" * 40, "external_id": "317"})):
         operation_id = f"{stage}-op-722"
@@ -610,7 +638,7 @@ def test_production_adapters_resume_unknown_effects_and_deliver_once(tmp_path, m
     assert pending["results"][0]["status"] == "outcome_unknown"
     assert ledger.get_episode_record(number, path=state_path)["status"] == "handoff_pending"
     sends = []
-    assert delivery_queue.drain(lambda job, text, failure: sends.append((job["origin"], text)) or None) == 1
+    assert delivery_queue.drain(lambda job, text, failure: sends.append((job["origin"], text)) or None) == 2
     # Simulate death after delivered ledger update but before workflow checkpoint completion.
     original_save = ledger.save_gooaye_workflow
     def crash_after_ledger(episode, workflow, **kwargs):
@@ -624,7 +652,9 @@ def test_production_adapters_resume_unknown_effects_and_deliver_once(tmp_path, m
     assert runner.run_cycle(state_path=state_path)["results"][0]["status"] == "done"
     assert runner.run_cycle(state_path=state_path)["discovered"] == []
     assert delivery_queue.drain(lambda *args: pytest.fail("duplicate delivery")) == 0
-    assert len(sends) == 1
+    assert len(sends) == 2
+    assert "已讀取音訊並完成轉錄" in sends[0][1]
+    assert "已完成入 Vault" in sends[1][1]
     assert len([c for c in github.calls if c[0] == "PUT"]) == 1
     assert len([c for c in github.calls if c[0] == "POST" and "dispatches" in c[1]]) == 1
     entry = ledger.get_episode_record(number, path=state_path)

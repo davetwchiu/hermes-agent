@@ -209,6 +209,8 @@ def save_gooaye_workflow(episode: str, workflow: dict, *, now: datetime | None =
         if not entry or entry["status"] in {"blocked", "expired"}:
             raise ValueError("workflow requires an existing unfinished episode")
         prior = entry.get("gooaye_workflow")
+        if prior:
+            prior = _copy_state(prior)
         if prior and prior.get("identity") != checked.get("identity"):
             raise ValueError("workflow identity conflicts with the existing episode checkpoint")
         if entry["status"] == "processed":
