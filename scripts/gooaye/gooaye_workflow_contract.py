@@ -16,17 +16,19 @@ import re
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 3
 STAGES = (
     "source_identity",
     "audio_chunks",
     "transcript_brief",
+    "transcript_notice",
     "publication",
     "dispatch",
     "trusted_receipt",
     "terminal_delivery",
 )
+LEGACY_STAGES = tuple(stage for stage in STAGES if stage != "transcript_notice")
 EPISODE_RE = re.compile(r"^EP[0-9]{3,}$")
 URL_RE = re.compile(r"^https?://[^\s]+$")
 STATUSES = {"pending", "running", "outcome_unknown", "completed", "failed"}
@@ -102,6 +104,21 @@ def new_state(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(state)
+    stages = result.get("stages")
+    if (result.get("schema_version") == 1 and isinstance(stages, dict)
+            and set(stages) == set(LEGACY_STAGES)):
+        # An old in-flight final send may already contain the brief.
+        terminal_status = stages["terminal_delivery"].get("status")
+        already_notified = terminal_status in {"running", "outcome_unknown", "completed"}
+        result["schema_version"] = SCHEMA_VERSION
+        result["stages"] = {
+            stage: ({"status": "completed", "attempts": 0,
+                     "result": {"delivery_status": "legacy_terminal_may_include_brief"}}
+                    if stage == "transcript_notice" and already_notified else
+                    {"status": "pending", "attempts": 0}
+                    if stage == "transcript_notice" else stages[stage])
+            for stage in STAGES
+        }
     if result.get("schema_version") != SCHEMA_VERSION:
         raise WorkflowContractError("unsupported workflow state schema")
     identity = result.get("identity")
@@ -125,6 +142,11 @@ def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
         if status not in STATUSES:
             raise WorkflowContractError(f"invalid status for {stage}")
     return result
+
+
+def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Validate and migrate a durable workflow state without mutating its caller."""
+    return _copy_state(state)
 
 
 def assert_identity(state: dict[str, Any], metadata: dict[str, Any]) -> None:

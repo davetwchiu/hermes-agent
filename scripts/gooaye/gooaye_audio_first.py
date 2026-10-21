@@ -441,7 +441,12 @@ def _record_problem(episode: str, reason: str, *, retryable: bool, source: dict 
 def _workflow_operation_id(identity: dict, stage: str) -> str:
     payload = json.dumps({"identity": identity["logical_id"], "stage": stage},
                          sort_keys=True, separators=(",", ":"))
-    return "gooaye-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # The delivery queue sorts same-time rows by execution ID after creation time.
+    prefix = {
+        "transcript_notice": "gooaye-00-",
+        "terminal_delivery": "gooaye-01-",
+    }.get(stage, "gooaye-")
+    return prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @contextmanager
@@ -1024,6 +1029,20 @@ def _execute_production_stage(stage: str, episode: str, operation_id: str,
         return {"artifact_hash": digest, "external_id": brief["source_transcript_path"],
                 "brief_text": brief["text"], "brief_provenance": brief,
                 "episode_identity": identity["logical_id"]}
+    if stage == "transcript_notice":
+        from cron.delivery_queue import enqueue
+        brief = context["prior_stages"]["transcript_brief"]
+        brief_hash = (brief.get("artifact_hash") or brief.get("content_hash")
+                      or hashlib.sha256(brief["brief_text"].encode("utf-8")).hexdigest())
+        content = (f"Gooaye EP{episode} 已讀取音訊並完成轉錄及繁體中文整理。\n\n"
+                   f"{brief['brief_text']}\n\n完成入 Vault 後我會再通知你。")
+        row = enqueue(operation_id, _original_job(), content)
+        if row["status"] in {"failed", "unknown", "suppressed"}:
+            raise StageBlocked("transcript-ready Telegram notice did not reach the delivery queue",
+                               retryable=False)
+        return {"artifact_hash": brief_hash, "external_id": operation_id,
+                "receipt_id": operation_id, "delivery_status": row["status"],
+                "episode_identity": identity["logical_id"]}
     if stage == "publication":
         entry = ledger.get_episode_record(episode, path=context["state_path"])
         prior = entry.get("handoff") if entry else None
@@ -1061,9 +1080,9 @@ def _execute_production_stage(stage: str, episode: str, operation_id: str,
         if receipt.get("receipt_verified") is not True:
             raise StageBlocked("terminal delivery requires a verified trusted-curation receipt", retryable=False)
         from cron.delivery_queue import enqueue
-        brief = context["prior_stages"]["transcript_brief"]["brief_text"]
-        content = (f"Gooaye EP{episode} 已完成轉錄及 Vault 整理。\n\n{brief}\n\n"
-                   f"Vault: {receipt['pull_request_url']}\nBridge: https://github.com/davetwchiu/hermes-bridge/issues/{receipt['bridge_issue']}")
+        content = (f"Gooaye EP{episode} 已完成入 Vault。\n\n"
+                   f"Vault: {receipt['pull_request_url']}\n"
+                   f"Bridge: https://github.com/davetwchiu/hermes-bridge/issues/{receipt['bridge_issue']}")
         job = _original_job()
         row = enqueue(operation_id, job, content)
         return _complete_delivered_episode(episode, operation_id, receipt, row, context["state_path"])
@@ -1121,6 +1140,24 @@ def _reconcile_production_stage(stage: str, episode: str, operation_id: str,
             **result, "logical_id": context["identity"]["logical_id"],
             "operation_id": operation_id,
         }}
+    if stage == "transcript_notice":
+        from cron.delivery_queue import get_status
+        row = get_status(operation_id)
+        if not row:
+            return {"status": "absent", "proof": f"existing-delivery-queue:{operation_id}:absent"}
+        if row["status"] in {"failed", "suppressed"}:
+            raise StageBlocked("transcript-ready Telegram notice delivery failed", retryable=False)
+        if row["status"] not in {"pending", "delivering", "delivered"}:
+            return {"status": "unknown"}
+        brief = context["prior_stages"].get("transcript_brief") or {}
+        brief_hash = (brief.get("artifact_hash") or brief.get("content_hash")
+                      or hashlib.sha256(brief["brief_text"].encode("utf-8")).hexdigest())
+        return {"status": "completed", "receipt": {
+            "logical_id": context["identity"]["logical_id"], "operation_id": operation_id,
+            "external_id": operation_id, "receipt_id": operation_id,
+            "content_hash": brief_hash,
+            "delivery_status": row["status"],
+        }}
     if stage == "terminal_delivery":
         from cron.delivery_queue import get_status
         row = get_status(operation_id)
@@ -1166,6 +1203,7 @@ def run_shared_stages(episode: str, metadata: dict, adapters: dict, *,
     workflow = entry.get("gooaye_workflow")
     if not workflow:
         raise AudioIssue("shared workflow requires completed source/audio checkpoints")
+    workflow = workflow_contract.normalize_state(workflow)
     workflow_contract.assert_identity(workflow, metadata)
     if workflow["stages"]["source_identity"]["status"] != "completed" or \
             workflow["stages"]["audio_chunks"]["status"] != "completed":
@@ -1175,7 +1213,7 @@ def run_shared_stages(episode: str, metadata: dict, adapters: dict, *,
         if not acquired:
             return {"status": "busy", "episode": f"EP{number}"}
         entry = ledger.get_episode_record(number, path=state_path)
-        workflow = entry["gooaye_workflow"]
+        workflow = workflow_contract.normalize_state(entry["gooaye_workflow"])
         workflow_contract.assert_identity(workflow, metadata)
         while True:
             directive = workflow_contract.resume_stage(workflow)
