@@ -31,13 +31,25 @@ EXECUTIONS_FILE: Optional[Path] = None
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
-    ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
-    ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
-    ("delivery", ("delivery", "deliver", "delivering")),
-    ("config", ("config", "configuration", "validation")),
-    ("script", ("script", "no_agent")),
-    ("agent", ("agent", "model", "provider", "inference")),
+    ("rate_limit", (r"\b429\b", r"\brate[ _-]?limit(?:ed)?\b", r"\busage[ _-]?limit\b", r"\bquota\b")),
+    ("tool_guardrail_halt", (r"\btool[_ -]guardrail[_ -]halt\b",)),
+    ("source_identity_conflict", (r"\bsource[_ -]identity[_ -]conflict\b", r"\bidentity mismatch\b")),
+    ("local_git_object_missing", (r"\blocal[_ -]git[_ -]object[_ -]missing\b",)),
+    ("remote_commit_absent", (r"\bremote[_ -]commit[_ -]absent\b",)),
+    ("remote_commit_unavailable", (r"\bremote[_ -]commit[_ -]unavailable\b",)),
+    ("remote_path_absent", (r"\bremote[_ -]path[_ -]absent\b",)),
+    ("blob_mismatch", (r"\b(?:source[_ -])?blob[_ -]mismatch\b",)),
+    ("transport_error", (r"\btransport[_ -]error\b", r"\bconnection reset\b", r"\bnetwork unreachable\b")),
+    ("timeout", (r"\btimeout\b", r"\btimed out\b")),
+    ("auth", (r"\b401\b", r"\bunauthorized\b",
+               r"\bauthentication(?:[_ -]?(?:error|failed))?\b",
+               r"\bauth(?:[_ -]?(?:error|failed))?\b")),
+    ("stale_data", (r"\bstale\b.{0,80}\b(?:input|inputs|data|macro|market)\b",
+                     r"\b(?:input|inputs|data|macro|market)\b.{0,80}\bstale\b")),
+    ("delivery", (r"\bdeliver(?:y|ing)?\b",)),
+    ("config", (r"\bconfig(?:uration)?\b", r"\bvalidation\b")),
+    ("script", (r"\bscript\b", r"\bno_agent\b")),
+    ("agent", (r"\bagent\b", r"\bmodel\b", r"\bprovider\b", r"\binference\b")),
 )
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
@@ -134,16 +146,13 @@ def _incident_id(job_id: str, error_sig: str) -> str:
 
 
 def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+    """Classify explicit error tokens conservatively; ambiguous text stays ``unknown``."""
     text = _normalize_error(error)
     if not text:
         return "unknown"
     for kind, patterns in _FAILURE_TYPE_ORDER:
         for pattern in patterns:
-            if pattern.startswith("\\b") and pattern.endswith("\\b"):
-                if re.search(pattern, text):
-                    return kind
-            elif pattern in text:
+            if re.search(pattern, text):
                 return kind
     return "unknown"
 

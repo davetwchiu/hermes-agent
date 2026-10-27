@@ -469,11 +469,15 @@ def _workflow_episode_lock(episode: str, state_path: Path):
 
 VAULT_REPOSITORY = "davetwchiu/david-knowledge-vault"
 VAULT_INGESTION_WORKFLOW = "hermes-vault-ingestion.yml"
+GOOAYE_CYCLE_OUTCOME_CONTRACT = "gooaye-cycle/v1"
 
 
 class GitHubApiError(RuntimeError):
     def __init__(self, method: str, endpoint: str, *, status: int | None = None):
         self.method, self.endpoint, self.status = method, endpoint, status
+        self.failure_type = ("rate_limit" if status == 429 else "auth" if status == 401 else
+                             "timeout" if status == 408 else
+                             "transport_error" if status is None or status >= 500 else "unknown")
         super().__init__(f"GitHub API {method} {endpoint} failed" +
                          (f" (HTTP {status})" if status else ""))
 
@@ -531,12 +535,14 @@ def production_stage_adapters() -> dict:
 
 class StageBlocked(RuntimeError):
     def __init__(self, reason: str, *, retryable: bool,
-                 outcome: str = "unknown", evidence: dict | None = None):
+                 outcome: str = "unknown", evidence: dict | None = None,
+                 failure_type: str = "unknown"):
         if outcome not in {"unknown", "pending"}:
             raise ValueError("invalid reconciliation outcome")
         self.retryable = retryable
         self.outcome = outcome
         self.evidence = dict(evidence or {})
+        self.failure_type = failure_type
         super().__init__(reason)
 
 
@@ -658,10 +664,93 @@ def _find_source_branch(episode: str):
     return _github_api("GET", _vault_endpoint(f"git/ref/heads/{_branch_name(episode)}"), allow_missing=True)
 
 
-def _read_source_at_ref(episode: str, ref: str):
+def _read_source_at_ref(episode: str, ref: str, *, allow_missing_path: bool = False):
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", str(ref or "")):
+        raise StageBlocked("source_identity_conflict: declared source commit is not a full SHA",
+                           retryable=False, failure_type="source_identity_conflict")
+    try:
+        commit = _github_api("GET", _vault_endpoint(f"git/commits/{ref}"))
+    except GitHubApiError as exc:
+        if exc.status == 404:
+            try:
+                repository = _github_api("GET", _vault_endpoint(""))
+            except GitHubApiError as repo_exc:
+                if repo_exc.status == 404:
+                    raise StageBlocked(
+                        "remote_commit_unavailable: authenticated GitHub API cannot confirm the Vault repository",
+                        retryable=True, failure_type="remote_commit_unavailable",
+                        evidence={"declared_commit": ref},
+                    ) from exc
+                if repo_exc.status == 401:
+                    raise StageBlocked("auth_error: GitHub rejected the Vault repository preflight",
+                                       retryable=False, failure_type="auth") from repo_exc
+                if repo_exc.status == 429:
+                    raise StageBlocked("rate_limit: GitHub Vault repository preflight was rate limited",
+                                       retryable=True, failure_type="rate_limit") from repo_exc
+                if repo_exc.status == 403:
+                    raise StageBlocked("GitHub denied the Vault repository preflight; cause is ambiguous",
+                                       retryable=True) from repo_exc
+                raise StageBlocked("transport_error: GitHub Vault repository preflight failed",
+                                   retryable=True, failure_type="transport_error",
+                                   evidence={"declared_commit": ref}) from repo_exc
+            if not isinstance(repository, dict):
+                raise StageBlocked(
+                    "remote_commit_unavailable: GitHub Vault repository preflight returned malformed data",
+                    retryable=True, failure_type="remote_commit_unavailable",
+                    evidence={"declared_commit": ref},
+                ) from exc
+            raise StageBlocked("remote_commit_absent: declared SHA was not found by the authenticated GitHub API",
+                               retryable=False, failure_type="remote_commit_absent",
+                               evidence={"declared_commit": ref}) from exc
+        if exc.status == 401:
+            raise StageBlocked("auth_error: GitHub rejected the source commit preflight",
+                               retryable=False, failure_type="auth") from exc
+        if exc.status == 429:
+            raise StageBlocked("rate_limit: GitHub source commit preflight was rate limited",
+                               retryable=True, failure_type="rate_limit") from exc
+        if exc.status == 403:
+            raise StageBlocked("GitHub denied the source commit preflight; cause is ambiguous",
+                               retryable=True) from exc
+        raise StageBlocked("transport_error: GitHub source commit preflight failed",
+                           retryable=True, failure_type="transport_error") from exc
+    if not isinstance(commit, dict):
+        raise StageBlocked(
+            "transport_error: GitHub source commit preflight returned malformed data",
+            retryable=True, failure_type="transport_error", evidence={"declared_commit": ref},
+        )
+    if str(commit.get("sha") or "").lower() != ref.lower():
+        raise StageBlocked("source_identity_conflict: GitHub returned a different commit SHA",
+                           retryable=False, failure_type="source_identity_conflict",
+                           evidence={"declared_commit": ref, "observed_commit": commit.get("sha")})
     source_path = f"00 Inbox/Gooaye Podcast/EP{ledger._episode(episode)}.md"
     endpoint = _vault_endpoint(f"contents/{quote(source_path, safe='/')}?ref={quote(ref, safe='/')}")
-    return _github_api("GET", endpoint, allow_missing=True)
+    try:
+        source = _github_api("GET", endpoint)
+    except GitHubApiError as exc:
+        if exc.status == 404:
+            if allow_missing_path:
+                return None
+            raise StageBlocked("remote_path_absent: source path is absent at the declared remote commit",
+                               retryable=False, failure_type="remote_path_absent",
+                               evidence={"declared_commit": ref, "path": source_path}) from exc
+        if exc.status == 401:
+            raise StageBlocked("auth_error: GitHub rejected the source path preflight",
+                               retryable=False, failure_type="auth") from exc
+        if exc.status == 429:
+            raise StageBlocked("rate_limit: GitHub source path preflight was rate limited",
+                               retryable=True, failure_type="rate_limit") from exc
+        if exc.status == 403:
+            raise StageBlocked("GitHub denied the source path preflight; cause is ambiguous",
+                               retryable=True) from exc
+        raise StageBlocked("transport_error: GitHub source path preflight failed",
+                           retryable=True, failure_type="transport_error") from exc
+    if not isinstance(source, dict):
+        raise StageBlocked(
+            "transport_error: GitHub source path preflight returned malformed data",
+            retryable=True, failure_type="transport_error",
+            evidence={"declared_commit": ref, "path": source_path},
+        )
+    return source
 
 
 def _find_bridge_task(identity: str):
@@ -737,7 +826,9 @@ def _publish_raw_source(episode: str, metadata: dict, identity: dict, brief: dic
                 "external_id": recovered["head_sha"],
                 "ingestion_identity": recovered.get("ingestion_identity") or recovered["identity"]}
     existing_ref = _find_source_branch(episode)
-    found = _read_source_at_ref(episode, branch) if existing_ref else None
+    existing_head = ((existing_ref.get("object") or {}).get("sha")
+                     if isinstance(existing_ref, dict) else None)
+    found = _read_source_at_ref(episode, existing_head, allow_missing_path=True) if existing_ref else None
     if found:
         if _github_content_bytes(found) != expected:
             raise StageBlocked("existing Gooaye source conflicts with this identity/content", retryable=False)
@@ -748,7 +839,12 @@ def _publish_raw_source(episode: str, metadata: dict, identity: dict, brief: dic
             raise StageBlocked("existing source commit has no recorded base", retryable=False)
     else:
         # A missing branch is not evidence that an earlier transaction never existed.
-        if _read_source_at_ref(episode, "main"):
+        main_ref = _github_api("GET", _vault_endpoint("git/ref/heads/main"))
+        main_sha = (main_ref.get("object") or {}).get("sha") if isinstance(main_ref, dict) else None
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", str(main_sha or "")):
+            raise StageBlocked("source_identity_conflict: canonical main ref lacks an exact commit SHA",
+                               retryable=False, failure_type="source_identity_conflict")
+        if _read_source_at_ref(episode, main_sha, allow_missing_path=True):
             raise StageBlocked("episode source already exists on main without matching task provenance", retryable=False)
         if existing_ref:
             base_sha = intent.get("base_sha")
@@ -756,15 +852,16 @@ def _publish_raw_source(episode: str, metadata: dict, identity: dict, brief: dic
                     or intent.get("artifact_hash") != hashlib.sha256(expected).hexdigest()):
                 raise StageBlocked("source-less branch has no matching owned publication checkpoint", retryable=False)
         else:
-            main_ref = _github_api("GET", _vault_endpoint("git/ref/heads/main"))
-            base_sha = main_ref["object"]["sha"]
+            base_sha = main_sha
             record["result"] = {"base_sha": base_sha, "branch": branch,
                                 "artifact_hash": hashlib.sha256(expected).hexdigest()}
             ledger.save_gooaye_workflow(episode, workflow, path=state_path)
             _github_api("POST", _vault_endpoint("git/refs"), {"ref": f"refs/heads/{branch}", "sha": base_sha})
         # Recheck create-only path and branch CAS immediately before the content write.
         fresh = _find_source_branch(episode)
-        if not fresh or fresh["object"]["sha"] != base_sha or _read_source_at_ref(episode, branch):
+        fresh_head = ((fresh.get("object") or {}).get("sha") if isinstance(fresh, dict) else None)
+        if (not fresh or fresh_head != base_sha
+                or _read_source_at_ref(episode, fresh_head, allow_missing_path=True)):
             raise StageBlocked("publication branch/path changed before create-only write", retryable=False)
         created = _github_api("PUT", _vault_endpoint(f"contents/{quote(source_path, safe='/')}"), {
             "message": f"Ingest Gooaye EP{ledger._episode(episode)} source",
@@ -900,8 +997,11 @@ def _verified_trusted_receipt(episode: str, identity: dict, publication: dict) -
     source_head = publication.get("head_sha")
     source_base = publication.get("base_sha")
     ingestion_identity = publication.get("ingestion_identity")
-    if not all((source_path, source_blob, source_head, source_base, ingestion_identity)):
-        raise StageBlocked("trusted receipt requires the exact persisted source handoff", retryable=False)
+    if not all(isinstance(value, str) and value.strip()
+               for value in (source_path, source_blob, source_head, source_base, ingestion_identity)):
+        raise StageBlocked("source_identity_conflict: trusted receipt lacks the exact persisted source handoff",
+                           retryable=False, failure_type="source_identity_conflict")
+    source_blob, source_head = source_blob.lower(), source_head.lower()
     issue = _find_bridge_task(ingestion_identity)
     if not issue:
         raise StageBlocked("exact vault-ingest Bridge task is not yet visible", retryable=True)
@@ -909,7 +1009,10 @@ def _verified_trusted_receipt(episode: str, identity: dict, publication: dict) -
     labels = {label if isinstance(label, str) else label.get("name")
               for label in issue.get("labels", [])}
     if "failed" in labels or issue.get("state_reason") == "not_planned":
-        raise StageBlocked("exact Bridge task is failed or rejected", retryable=False)
+        raise StageBlocked("source_identity_conflict: exact Bridge task is failed or rejected",
+                           retryable=False, failure_type="source_identity_conflict",
+                           evidence={"bridge_task": task_id, "state": issue.get("state"),
+                                     "state_reason": issue.get("state_reason"), "labels": sorted(labels)})
     terminal_label = "completed" in labels
     terminal_closed = issue.get("state") == "closed" and issue.get("state_reason") == "completed"
     if not terminal_label and not terminal_closed:
@@ -961,10 +1064,26 @@ def _verified_trusted_receipt(episode: str, identity: dict, publication: dict) -
             or int(receipt.get("task_id", 0)) != task_id or int(receipt.get("pr", 0)) != pr_number):
         raise StageBlocked("Vault receipt source commit/path/blob/task/PR identity mismatch", retryable=False)
 
+    expected_path = f"00 Inbox/Gooaye Podcast/EP{ledger._episode(episode)}.md"
+    if source_path != expected_path:
+        raise StageBlocked("source_identity_conflict: persisted path differs from the canonical episode path",
+                           retryable=False, failure_type="source_identity_conflict",
+                           evidence={"declared_path": source_path, "expected_path": expected_path})
     source_at_head = _read_source_at_ref(episode, source_head)
-    raw = _github_content_bytes(source_at_head or {})
-    if source_at_head.get("sha") != source_blob or f"Episode identity: `{identity['logical_id']}`".encode() not in raw:
-        raise StageBlocked("immutable source blob does not carry the exact Gooaye episode identity", retryable=False)
+    raw = _github_content_bytes(source_at_head)
+    computed_blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+    remote_blob = str(source_at_head.get("sha") or "").lower()
+    if remote_blob != source_blob or computed_blob != source_blob:
+        raise StageBlocked("source_blob_mismatch: immutable source blob differs from the declared receipt",
+                           retryable=False, failure_type="blob_mismatch",
+                           evidence={"path": source_path, "commit": source_head,
+                                     "expected_blob": source_blob,
+                                     "remote_blob": remote_blob,
+                                     "computed_blob": computed_blob})
+    if f"Episode identity: `{identity['logical_id']}`".encode() not in raw:
+        raise StageBlocked("source_identity_conflict: immutable blob does not carry the exact Gooaye episode identity",
+                           retryable=False, failure_type="source_identity_conflict",
+                           evidence={"path": source_path, "commit": source_head, "blob": source_blob})
     outputs = receipt.get("outputs") or []
     if not outputs and receipt.get("result") not in {"noop", "no-op"}:
         raise StageBlocked("processed Gooaye receipt has no durable Vault output targets", retryable=False)
@@ -1103,15 +1222,106 @@ def _reconcile_production_stage(stage: str, episode: str, operation_id: str,
             "brief_text": brief["text"], "brief_provenance": brief,
         }}
     if stage == "publication":
-        previous = context["prior_stages"].get("transcript_brief") or {}
-        metadata = source_metadata(episode, state_path=context["state_path"])
-        result = _publish_raw_source(episode, metadata, context["identity"],
-                                     previous.get("brief_provenance") or {}, state_path=context["state_path"])
-        return {"status": "completed", "receipt": {
-            **result, "logical_id": context["identity"]["logical_id"],
-            "operation_id": operation_id, "receipt_id": result["blob_sha"],
-            "content_hash": result["artifact_hash"],
-        }}
+        record = state["stages"][stage]
+        intent = record.get("result") or {}
+        expected_branch = _branch_name(episode)
+        branch = intent.get("branch") or expected_branch
+        brief = context["prior_stages"].get("transcript_brief") or {}
+        source_meta = source_metadata(episode, state_path=context["state_path"])
+        expected = _source_markdown(
+            episode, source_meta, context["identity"], brief.get("brief_provenance") or {})
+        expected_hash = hashlib.sha256(expected).hexdigest()
+
+        def blocked(reason, failure_type="source_identity_conflict", evidence=None):
+            return {"status": "blocked", "reason": reason, "failure_type": failure_type,
+                    "evidence": evidence or {"stage": stage, "operation_id": operation_id}}
+
+        def completed(base_sha, head_sha, source, declared_blob=None):
+            if (not ledger.SHA_RE.fullmatch(str(base_sha or ""))
+                    or not ledger.SHA_RE.fullmatch(str(head_sha or ""))):
+                return blocked("source_identity_conflict: publication base/head is not an exact SHA")
+            commit = _github_api("GET", _vault_endpoint(f"commits/{head_sha}")) or {}
+            parent = (commit.get("parents") or [{}])[0].get("sha")
+            if str(parent or "").lower() != str(base_sha).lower():
+                return blocked("source_identity_conflict: publication commit parent differs from intent",
+                               evidence={"expected_base": base_sha, "observed_parent": parent})
+            raw = _github_content_bytes(source)
+            blob_sha = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+            if (raw != expected or str(source.get("sha") or "").lower() != blob_sha
+                    or (declared_blob and str(declared_blob).lower() != blob_sha)):
+                return blocked("source_blob_mismatch: exact publication bytes do not match the intent",
+                               "blob_mismatch", {"commit": head_sha, "expected_blob": blob_sha,
+                                                 "observed_blob": source.get("sha"),
+                                                 "declared_blob": declared_blob})
+            result = {"artifact_hash": expected_hash, "external_id": head_sha,
+                      "base_sha": base_sha, "head_sha": head_sha, "blob_sha": blob_sha,
+                      "source_path": f"00 Inbox/Gooaye Podcast/EP{ledger._episode(episode)}.md",
+                      "branch": branch, "ingestion_identity": ledger.ingestion_identity(head_sha)}
+            return {"status": "completed", "receipt": {
+                **result, "logical_id": context["identity"]["logical_id"],
+                "operation_id": operation_id, "receipt_id": blob_sha,
+                "content_hash": expected_hash,
+            }}
+
+        if branch != expected_branch:
+            return blocked("source_identity_conflict: publication branch differs from episode identity",
+                           evidence={"declared_branch": branch, "expected_branch": expected_branch})
+        if intent.get("artifact_hash") and intent["artifact_hash"] != expected_hash:
+            return blocked("source_identity_conflict: publication intent bytes differ from current source",
+                           evidence={"declared_hash": intent["artifact_hash"], "expected_hash": expected_hash})
+
+        ref = _find_source_branch(episode)
+        if ref:
+            head_sha = ((ref.get("object") or {}).get("sha") if isinstance(ref, dict) else None)
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", str(head_sha or "")):
+                return blocked("source_identity_conflict: publication branch lacks an exact commit SHA")
+            try:
+                source = _read_source_at_ref(episode, head_sha, allow_missing_path=True)
+            except StageBlocked as exc:
+                return {"status": "pending" if exc.retryable and exc.outcome == "pending" else
+                        "unknown" if exc.retryable else "blocked", "reason": str(exc),
+                        "failure_type": exc.failure_type, "evidence": exc.evidence}
+            if source:
+                base_sha = intent.get("base_sha")
+                if not re.fullmatch(r"[0-9a-fA-F]{40}", str(base_sha or "")):
+                    return blocked("source_identity_conflict: exact publication base is not recorded",
+                                   evidence={"declared_head": head_sha, "operation_id": operation_id})
+                return completed(base_sha, head_sha, source, intent.get("blob_sha"))
+            if intent.get("base_sha") and str(head_sha).lower() == str(intent["base_sha"]).lower():
+                return {"status": "absent", "proof": f"publication-source-absent:{branch}@{head_sha}"}
+            return blocked("source_identity_conflict: branch moved without the exact source path",
+                           evidence={"declared_base": intent.get("base_sha"), "observed_head": head_sha})
+
+        recovered = _existing_publication(episode)
+        if recovered:
+            expected_path = f"00 Inbox/Gooaye Podcast/EP{ledger._episode(episode)}.md"
+            if recovered.get("source_path") != expected_path:
+                return blocked("source_identity_conflict: recovered publication path differs from episode identity",
+                               evidence={"declared_path": recovered.get("source_path"),
+                                         "expected_path": expected_path})
+            try:
+                source = _read_source_at_ref(episode, recovered["head_sha"])
+            except StageBlocked as exc:
+                return {"status": "pending" if exc.retryable and exc.outcome == "pending" else
+                        "unknown" if exc.retryable else "blocked", "reason": str(exc),
+                        "failure_type": exc.failure_type, "evidence": exc.evidence}
+            return completed(recovered["base_sha"], recovered["head_sha"], source,
+                             recovered.get("blob_sha"))
+
+        main_ref = _github_api("GET", _vault_endpoint("git/ref/heads/main"))
+        main_sha = (main_ref.get("object") or {}).get("sha") if isinstance(main_ref, dict) else None
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", str(main_sha or "")):
+            return {"status": "unknown", "reason": "canonical main ref is not currently verifiable"}
+        try:
+            source = _read_source_at_ref(episode, main_sha, allow_missing_path=True)
+        except StageBlocked as exc:
+            return {"status": "pending" if exc.retryable and exc.outcome == "pending" else
+                    "unknown" if exc.retryable else "blocked", "reason": str(exc),
+                    "failure_type": exc.failure_type, "evidence": exc.evidence}
+        if source:
+            return blocked("source_identity_conflict: episode path exists on main without exact task provenance",
+                           evidence={"main_sha": main_sha, "path": source.get("path")})
+        return {"status": "absent", "proof": f"publication-absent:branch={branch};main={main_sha}"}
     if stage == "dispatch":
         publication = context["prior_stages"].get("publication") or {}
         if not publication.get("ingestion_identity"):
@@ -1130,7 +1340,8 @@ def _reconcile_production_stage(stage: str, episode: str, operation_id: str,
             result = _verified_trusted_receipt(episode, context["identity"], publication)
         except StageBlocked as exc:
             if not exc.retryable:
-                raise workflow_contract.ReceiptConflict(str(exc)) from exc
+                return {"status": "blocked", "reason": str(exc),
+                        "failure_type": exc.failure_type, "evidence": exc.evidence}
             evidence = dict(exc.evidence)
             evidence.setdefault("stage", stage)
             evidence.setdefault("operation_id", operation_id)
@@ -1222,9 +1433,16 @@ def run_shared_stages(episode: str, metadata: dict, adapters: dict, *,
                         "identity": identity["logical_id"],
                         "publication_route": workflow_contract.checkout_action(
                             list(dirty_paths or []), list(relevant_paths or []))}
+            was_failed = False
             if directive.startswith("failed:"):
                 failed_stage = directive.partition(":")[2]
-                return {"status": "failed", "episode": f"EP{number}", "stage": failed_stage}
+                failed_record = workflow["stages"][failed_stage]
+                if (failed_record.get("retryable") is False
+                        and failed_record.get("blocker_fingerprint")):
+                    directive, was_failed = f"reconcile:{failed_stage}", True
+                else:
+                    return {"status": "failed", "episode": f"EP{number}", "stage": failed_stage,
+                            "blocker_fingerprint": failed_record.get("blocker_fingerprint")}
             reconcile = directive.startswith("reconcile:")
             stage = directive.partition(":")[2] if reconcile else directive
             if stage not in workflow_contract.STAGES[2:]:
@@ -1256,15 +1474,44 @@ def run_shared_stages(episode: str, metadata: dict, adapters: dict, *,
                     if not isinstance(evidence, dict):
                         evidence = {"kind": "unknown_reconciliation", "stage": stage,
                                     "operation_id": operation_id}
+                    if was_failed:
+                        workflow = workflow_contract.record_blocker(
+                            workflow, stage, observation.get("reason") or "blocked preflight remains unresolved",
+                            failure_type=observation.get("failure_type") or "unknown", evidence=evidence)
+                        ledger.save_gooaye_workflow(number, workflow, path=state_path)
                     result = {"status": "outcome_pending" if status == "pending" else "outcome_unknown",
                               "episode": f"EP{number}", "stage": stage,
                               "reason": observation.get("reason"), "evidence": evidence}
+                    if was_failed:
+                        result["blocker_fingerprint"] = workflow["stages"][stage]["blocker_fingerprint"]
                     if status == "pending":
                         result["reconciliation"] = "pending"
                     return result
+                if status == "blocked":
+                    workflow = workflow_contract.record_blocker(
+                        workflow, stage, observation.get("reason") or "trusted receipt preflight blocked",
+                        failure_type=observation.get("failure_type") or "unknown",
+                        evidence=observation.get("evidence") or {},
+                    )
+                    ledger.save_gooaye_workflow(number, workflow, path=state_path)
+                    record = workflow["stages"][stage]
+                    return {"status": "blocked", "episode": f"EP{number}", "stage": stage,
+                            "reason": record["failure_reason"], "failure_type": record["failure_type"],
+                            "blocker_fingerprint": record["blocker_fingerprint"]}
                 if status == "absent":
-                    workflow = workflow_contract.requeue_after_confirmed_absence(
-                        workflow, stage, observation.get("proof", ""))
+                    proof = observation.get("proof", "")
+                    if was_failed:
+                        candidate = workflow_contract.record_blocker(
+                            workflow, stage, "precondition remains absent",
+                            failure_type="unknown", evidence={"proof": proof})
+                        if (candidate["stages"][stage]["blocker_fingerprint"]
+                                == workflow["stages"][stage].get("blocker_fingerprint")):
+                            record = workflow["stages"][stage]
+                            return {"status": "blocked", "episode": f"EP{number}", "stage": stage,
+                                    "reason": record.get("failure_reason"),
+                                    "failure_type": record.get("failure_type"),
+                                    "blocker_fingerprint": record.get("blocker_fingerprint")}
+                    workflow = workflow_contract.requeue_after_confirmed_absence(workflow, stage, proof)
                     ledger.save_gooaye_workflow(number, workflow, path=state_path)
                     continue
                 if status != "completed" or not isinstance(observation.get("receipt"), dict):
@@ -1286,10 +1533,19 @@ def run_shared_stages(episode: str, metadata: dict, adapters: dict, *,
                     workflow = workflow_contract.mark_outcome_unknown(workflow, stage)
                 else:
                     workflow = workflow_contract.fail_stage(
-                        workflow, stage, str(exc), retryable=exc.retryable)
+                        workflow, stage, str(exc), retryable=exc.retryable,
+                        failure_type=exc.failure_type, evidence=exc.evidence)
                 ledger.save_gooaye_workflow(number, workflow, path=state_path)
-                return {"status": "retryable" if exc.retryable else "failed",
-                        "episode": f"EP{number}", "stage": stage, "reason": str(exc)}
+                record = workflow["stages"][stage]
+                if stage == "trusted_receipt" and exc.retryable:
+                    status = "outcome_pending" if exc.outcome == "pending" else "outcome_unknown"
+                else:
+                    status = "retryable" if exc.retryable else "failed"
+                return {"status": status,
+                        "episode": f"EP{number}", "stage": stage, "reason": str(exc),
+                        "failure_type": exc.failure_type,
+                        "blocker_fingerprint": record.get("blocker_fingerprint"),
+                        **({"reconciliation": "pending"} if status == "outcome_pending" else {})}
             except Exception:
                 workflow = ledger.get_episode_record(number, path=state_path)["gooaye_workflow"]
                 workflow = workflow_contract.mark_outcome_unknown(workflow, stage)
@@ -1417,7 +1673,8 @@ def run_cycle(*, state_path: Path = ledger.STATE_PATH, now: datetime | None = No
     """Drain current durable due/pending episode state using the shared runner."""
     with _workflow_episode_lock("cycle", Path(state_path)) as acquired:
         if not acquired:
-            return {"status": "busy", "discovered": [], "results": [], "audio_attention": []}
+            return {"status": "busy", "outcome_contract": GOOAYE_CYCLE_OUTCOME_CONTRACT,
+                    "discovered": [], "results": [], "audio_attention": []}
         work = ledger.work(now=now, path=state_path)
         due = work.get("audio_due", work.get("due", []))
         handoffs = work.get("handoff_pending", [])
@@ -1433,13 +1690,16 @@ def run_cycle(*, state_path: Path = ledger.STATE_PATH, now: datetime | None = No
             try:
                 results.append(_run_episode_transaction(number, state_path=state_path,
                                                         max_chunks=max_chunks))
-            except (AudioIssue, StageBlocked, workflow_contract.WorkflowContractError, OSError) as exc:
-                results.append({"episode": f"EP{number}", "status": "blocked", "reason": str(exc)})
+            except (AudioIssue, StageBlocked, GitHubApiError,
+                    workflow_contract.WorkflowContractError, OSError) as exc:
+                results.append({"episode": f"EP{number}", "status": "blocked", "reason": str(exc),
+                                "failure_type": getattr(exc, "failure_type", "unknown")})
         attention = work.get("audio_attention", [])
         blocked = any(result.get("status") in {"blocked", "failed", "review_required",
-                                                "outcome_unknown", "outcome_pending"}
+                                                "outcome_unknown", "outcome_pending", "retryable", "missing"}
                       for result in results)
         return {"status": "cycle_attention" if blocked or attention else "cycle_complete",
+                "outcome_contract": GOOAYE_CYCLE_OUTCOME_CONTRACT,
                 "discovered": [f"EP{number}" for number in sorted(candidates, key=int)],
                 "results": results, "audio_attention": attention,
                 "expired": work.get("expired", [])}
@@ -1715,8 +1975,9 @@ def main() -> int:
                 raise AudioIssue("--max-chunks must be a positive integer")
             result = run_cycle(max_chunks=args.max_chunks)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            hard_failure = result.get("status") == "failed" or bool(result.get("audio_attention")) or any(
-                item.get("status") in {"blocked", "failed", "review_required"}
+            hard_failure = bool(result.get("audio_attention")) or any(
+                item.get("status") in {"blocked", "failed", "review_required",
+                                        "outcome_unknown", "outcome_pending", "retryable", "missing"}
                 for item in result.get("results", [])
             )
             return 1 if hard_failure else 0
