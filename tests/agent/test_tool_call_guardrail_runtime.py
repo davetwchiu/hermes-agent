@@ -458,10 +458,48 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     halt_text = result["final_response"]
     assert "stopped retrying" in halt_text
 
-    # The halt message must have been pushed through the callback at least
-    # once.  Empty-queue SSE writers were the bug — clients saw no content
-    # delta before the finish chunk.
+    # The halt message must be visible to streaming clients as well as in the final result.
     text_deltas = [d for d in deltas if isinstance(d, str)]
-    assert halt_text in text_deltas, (
-        f"halt message was never streamed; callback only saw {deltas!r}"
+    assert halt_text in text_deltas, f"halt message was never streamed: {deltas!r}"
+
+
+def test_trusted_gooaye_blocker_ends_turn_without_following_tool_or_model_calls(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    command = (f"{tmp_path}/current/venv/bin/python "
+               f"{tmp_path}/current/scripts/gooaye/gooaye_audio_first.py cycle")
+    cycle = {
+        "outcome_contract": "gooaye-cycle/v1",
+        "status": "cycle_attention",
+        "discovered": ["EP708"],
+        "results": [{"episode": "EP708", "status": "blocked", "stage": "trusted_receipt"}],
+        "audio_attention": [],
+    }
+    terminal_result = json.dumps({"output": json.dumps(cycle), "exit_code": 1, "error": None})
+    agent = _make_agent("terminal", max_iterations=10)
+    tool_calls = [
+        _mock_tool_call("terminal", json.dumps({"command": command}), "cycle"),
+        _mock_tool_call("terminal", json.dumps({"command": "echo MUST_NOT_RUN"}), "extra"),
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls),
+        _mock_response(content="MUST_NOT_REQUEST"),
+    ]
+    agent._disable_streaming = True
+
+    with (
+        patch("model_tools.handle_function_call", return_value=terminal_result) as tool_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Run the current Gooaye cycle once.")
+
+    assert tool_call.call_count == 1
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == (
+        "Gooaye cycle completed with item(s) requiring attention: EP708 (trusted_receipt)."
     )
+    assert any("was not started after the deterministic job runner returned" in str(message.get("content"))
+               for message in result["messages"] if message.get("role") == "tool")

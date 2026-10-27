@@ -145,6 +145,50 @@ def test_runner_advances_all_shared_stages_per_episode_and_is_idempotent(tmp_pat
         assert len({call[2] for call in adapter.calls}) == 3
 
 
+def test_cycle_keeps_blocked_episode_local_and_continues_distinct_episodes(tmp_path, monkeypatch):
+    state_path = tmp_path / "episodes.json"
+    calls = []
+    monkeypatch.setattr(ledger, "work", lambda **_kwargs: {
+        "audio_due": [{"episode": "708"}, {"episode": "709"}],
+        "handoff_pending": [], "audio_attention": [], "expired": [],
+    })
+    monkeypatch.setattr(ledger, "ledger_snapshot", lambda **_kwargs: {"episodes": {}})
+
+    def process(number, **_kwargs):
+        calls.append(number)
+        return ({"episode": f"EP{number}", "status": "blocked", "stage": "trusted_receipt"}
+                if number == "708" else {"episode": f"EP{number}", "status": "done"})
+
+    monkeypatch.setattr(runner, "_run_episode_transaction", process)
+    result = runner.run_cycle(state_path=state_path)
+
+    assert result["outcome_contract"] == "gooaye-cycle/v1"
+    assert result["status"] == "cycle_attention"
+    assert calls == ["708", "709"]
+    assert [item["status"] for item in result["results"]] == ["blocked", "done"]
+
+
+def test_cycle_contains_github_rate_limit_and_continues_distinct_episodes(tmp_path, monkeypatch):
+    state_path = tmp_path / "episodes.json"
+    monkeypatch.setattr(ledger, "work", lambda **_kwargs: {
+        "audio_due": [{"episode": "708"}, {"episode": "709"}],
+        "handoff_pending": [], "audio_attention": [], "expired": [],
+    })
+    monkeypatch.setattr(ledger, "ledger_snapshot", lambda **_kwargs: {"episodes": {}})
+
+    def process(number, **_kwargs):
+        if number == "708":
+            raise runner.GitHubApiError("GET", "repos/example/path", status=429)
+        return {"episode": "EP709", "status": "done"}
+
+    monkeypatch.setattr(runner, "_run_episode_transaction", process)
+    result = runner.run_cycle(state_path=state_path)
+
+    assert result["status"] == "cycle_attention"
+    assert [item["status"] for item in result["results"]] == ["blocked", "done"]
+    assert result["results"][0]["failure_type"] == "rate_limit"
+
+
 def test_production_brief_adapter_receives_source_metadata_from_shared_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_original_job", lambda: {"provider": "openai-codex", "model": "gpt-6-luna"})
     monkeypatch.setattr(runner, "_generate_edited_brief", lambda text: "faithful edited brief")
@@ -213,16 +257,21 @@ def test_production_publication_reconciliation_preserves_exact_handoff_fields(tm
                                       external_id="notice-op-711")
     workflow = contract.start_stage(
         workflow, "publication", "publication-op-711", operation_id="publication-op-711")
+    raw = b"exact source bytes 711"
+    base_sha, head_sha = "b" * 40, "a" * 40
+    blob_sha = runner.hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+    workflow["stages"]["publication"]["result"] = {
+        "base_sha": base_sha, "branch": "hermes/vault-ingest-gooaye-EP711",
+        "artifact_hash": runner.hashlib.sha256(raw).hexdigest(),
+    }
     workflow = contract.mark_outcome_unknown(workflow, "publication")
     ledger.save_gooaye_workflow("711", workflow, path=state_path)
 
-    raw = b"exact source bytes 711"
-    base_sha, head_sha, blob_sha = "b" * 40, "a" * 40, "c" * 40
     ref = {"object": {"sha": head_sha}}
     source = {"sha": blob_sha, "encoding": "base64",
               "content": runner.base64.b64encode(raw).decode("ascii")}
     monkeypatch.setattr(runner, "_find_source_branch", lambda episode: ref)
-    monkeypatch.setattr(runner, "_read_source_at_ref", lambda episode, branch: source)
+    monkeypatch.setattr(runner, "_read_source_at_ref", lambda episode, ref, **kwargs: source)
     monkeypatch.setattr(runner, "_source_markdown", lambda *args: raw)
     monkeypatch.setattr(runner, "source_metadata", lambda episode, **kwargs: metadata)
     monkeypatch.setattr(runner, "_github_api", lambda *args, **kwargs: {"parents": [{"sha": base_sha}]})
@@ -394,13 +443,13 @@ def test_known_pending_trusted_receipt_keeps_typed_blocker_evidence(tmp_path, mo
     workflow = ledger.get_episode_record("722", path=state_path)["gooaye_workflow"]
     publication = {
         "artifact_hash": "d" * 64,
-        "external_id": "h" * 40,
+        "external_id": "e" * 40,
         "base_sha": "b" * 40,
-        "head_sha": "h" * 40,
+        "head_sha": "e" * 40,
         "blob_sha": "c" * 40,
         "source_path": "00 Inbox/Gooaye Podcast/EP722.md",
         "branch": "hermes/vault-ingest-gooaye-EP722",
-        "ingestion_identity": "vault-ingest:" + "h" * 40,
+        "ingestion_identity": "vault-ingest:" + "e" * 40,
     }
     for stage, result in (("transcript_brief", {"artifact_hash": "a" * 64}),
                           ("transcript_notice", {"artifact_hash": "a" * 64}),
@@ -435,6 +484,70 @@ def test_known_pending_trusted_receipt_keeps_typed_blocker_evidence(tmp_path, mo
         "ingestion_identity": publication["ingestion_identity"],
         "stage": "trusted_receipt", "operation_id": "trusted-op-722",
     }
+
+
+def test_trusted_receipt_blocker_fingerprint_persists_until_preconditions_resolve(tmp_path, monkeypatch):
+    state_path = tmp_path / "episodes.json"
+    metadata = setup_episode(state_path, "723")
+    workflow = ledger.get_episode_record("723", path=state_path)["gooaye_workflow"]
+    publication = {
+        "artifact_hash": "d" * 64, "external_id": "e" * 40,
+        "base_sha": "b" * 40, "head_sha": "e" * 40, "blob_sha": "c" * 40,
+        "source_path": "00 Inbox/Gooaye Podcast/EP723.md",
+        "branch": "hermes/vault-ingest-gooaye-EP723",
+        "ingestion_identity": "vault-ingest:" + "e" * 40,
+    }
+    for stage, result in (("transcript_brief", {"artifact_hash": "a" * 64}),
+                          ("transcript_notice", {"artifact_hash": "a" * 64}),
+                          ("publication", publication),
+                          ("dispatch", {"artifact_hash": "c" * 40, "external_id": "318"})):
+        operation_id = f"{stage}-op-723"
+        workflow = contract.start_stage(workflow, stage, operation_id, operation_id=operation_id)
+        workflow = contract.complete_stage(workflow, stage, artifact_hash=result["artifact_hash"],
+                                           external_id=result.get("external_id"))
+        workflow["stages"][stage]["result"] = result
+    workflow = contract.start_stage(workflow, "trusted_receipt", "trusted-op-723",
+                                    operation_id="trusted-op-723")
+    workflow = contract.mark_outcome_unknown(workflow, "trusted_receipt")
+    ledger.save_gooaye_workflow("723", workflow, path=state_path)
+    production = runner.production_stage_adapters()
+    production["terminal_delivery"] = Adapter()
+    preflights = []
+    available = {"value": False}
+
+    def verify(*_args):
+        preflights.append(available["value"])
+        if not available["value"]:
+            raise runner.StageBlocked(
+                "source_blob_mismatch: immutable source differs from the declared receipt",
+                retryable=False, failure_type="blob_mismatch",
+                evidence={"commit": "e" * 40, "expected_blob": "c" * 40, "observed_blob": "9" * 40},
+            )
+        return {"artifact_hash": "e" * 64, "content_hash": "e" * 64,
+                "external_id": "318", "receipt_id": "trusted-receipt",
+                "receipt_verified": True, "handoff": {"identity": "vault-ingest:" + "e" * 40}}
+
+    monkeypatch.setattr(runner, "_verified_trusted_receipt", verify)
+    blocked = runner.run_shared_stages("723", metadata, production, state_path=state_path)
+    first = ledger.get_episode_record("723", path=state_path)["gooaye_workflow"]["stages"]["trusted_receipt"]
+    blocked_again = runner.run_shared_stages("723", metadata, production, state_path=state_path)
+    second = ledger.get_episode_record("723", path=state_path)["gooaye_workflow"]["stages"]["trusted_receipt"]
+
+    assert blocked["status"] == blocked_again["status"] == "blocked"
+    assert first["blocker_fingerprint"] == second["blocker_fingerprint"]
+    assert first["failure_type"] == "blob_mismatch"
+    assert len(preflights) == 2  # read-only exact preflight; no stage write is retried
+
+    workflow = ledger.get_episode_record("723", path=state_path)["gooaye_workflow"]
+    workflow["stages"]["trusted_receipt"]["status"] = "failed"
+    workflow["stages"]["trusted_receipt"]["retryable"] = False
+    ledger.save_gooaye_workflow("723", workflow, path=state_path)
+    available["value"] = True
+    resolved = runner.run_shared_stages("723", metadata, production, state_path=state_path)
+    final = ledger.get_episode_record("723", path=state_path)["gooaye_workflow"]["stages"]["trusted_receipt"]
+    assert resolved["status"] == "done"
+    assert final["status"] == "completed"
+    assert "blocker_fingerprint" not in final
 
 
 def test_edited_brief_uses_full_transcript_and_reuses_verified_artifact(tmp_path, monkeypatch):
@@ -526,7 +639,7 @@ def test_cycle_cli_entrypoint_invokes_shared_cycle(monkeypatch, capsys):
 
 @pytest.mark.parametrize("result,expected", [
     ({"status": "cycle_attention", "results": [{"status": "outcome_unknown"}],
-      "audio_attention": []}, 0),
+      "audio_attention": []}, 1),
     ({"status": "cycle_attention", "results": [{"status": "blocked"}],
       "audio_attention": []}, 1),
     ({"status": "cycle_attention", "results": [],
@@ -577,7 +690,13 @@ class FakeGitHub:
         if method == "GET" and "contents/" in endpoint:
             from urllib.parse import unquote
             path, ref = endpoint.split("contents/")[1].split("?ref=")
-            return self.files.get((unquote(path), unquote(ref)))
+            value = self.files.get((unquote(path), unquote(ref)))
+            if value is None:
+                raise runner.GitHubApiError(method, endpoint, status=404)
+            return value
+        if method == "GET" and "/git/commits/" in endpoint:
+            sha = endpoint.rsplit("/", 1)[1]
+            return {"sha": sha, "parents": [{"sha": self.parents.get(sha, "b" * 40)}]}
         if method == "GET" and "/commits/" in endpoint:
             return {"parents": [{"sha": self.parents[endpoint.rsplit('/', 1)[1]]}]}
         if method == "POST" and endpoint.endswith("git/refs"):
@@ -643,9 +762,9 @@ def test_production_adapters_resume_unknown_effects_and_deliver_once(tmp_path, m
         return trusted_fixture(*args)
     monkeypatch.setattr(runner, "_verified_trusted_receipt", trusted)
     first = runner.run_cycle(state_path=state_path)
-    assert first["results"][0]["status"] == "outcome_unknown"
+    assert first["results"][0]["status"] == "outcome_unknown", first["results"][0]
     second = runner.run_cycle(state_path=state_path)
-    assert second["results"][0]["status"] == "retryable"
+    assert second["results"][0]["status"] == "outcome_unknown"
     for _ in range(4):
         assert runner.run_cycle(state_path=state_path)["results"][0]["status"] == "outcome_unknown"
     ready.append(True)
@@ -697,10 +816,71 @@ def test_deleted_source_branch_recovers_existing_exact_bridge_material(tmp_path,
         runner._publish_raw_source("720", metadata, contract.derive_identity(metadata), {}, state_path=state_path)
 
 
+def test_source_preflight_uses_authenticated_remote_exact_sha_without_local_git(monkeypatch):
+    commit = "a5d027db3a31f2aeccc3892bc57f18801d007d0b"
+    raw = b"historical remote source"
+    blob = runner.hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+    source = {"sha": blob, "encoding": "base64", "content": runner.base64.b64encode(raw).decode()}
+    calls = []
+
+    def api(method, endpoint, **kwargs):
+        calls.append((method, endpoint))
+        if endpoint.endswith(f"git/commits/{commit}"):
+            return {"sha": commit}
+        return source
+
+    monkeypatch.setattr(runner, "_github_api", api)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *_a, **_kw: pytest.fail("local Git must not be used"))
+
+    assert runner._read_source_at_ref("708", commit) == source
+    assert calls == [
+        ("GET", f"repos/davetwchiu/david-knowledge-vault/git/commits/{commit}"),
+        ("GET", "repos/davetwchiu/david-knowledge-vault/contents/00%20Inbox/Gooaye%20Podcast/EP708.md"
+         f"?ref={commit}"),
+    ]
+
+
+def test_source_preflight_distinguishes_remote_path_absence_from_missing_commit(monkeypatch):
+    commit = "a5d027db3a31f2aeccc3892bc57f18801d007d0b"
+    def api(_method, endpoint, **_kwargs):
+        if endpoint.endswith(f"git/commits/{commit}"):
+            return {"sha": commit}
+        raise runner.GitHubApiError("GET", endpoint, status=404)
+
+    monkeypatch.setattr(runner, "_github_api", api)
+    with pytest.raises(runner.StageBlocked, match="remote_path_absent") as blocked:
+        runner._read_source_at_ref("708", commit)
+    assert blocked.value.failure_type == "remote_path_absent"
+
+    calls = []
+    def missing_commit(_method, endpoint, **_kwargs):
+        calls.append(endpoint)
+        if endpoint == "repos/davetwchiu/david-knowledge-vault/":
+            return {"full_name": "davetwchiu/david-knowledge-vault"}
+        raise runner.GitHubApiError("GET", endpoint, status=404)
+    monkeypatch.setattr(runner, "_github_api", missing_commit)
+    with pytest.raises(runner.StageBlocked, match="remote_commit_absent") as unavailable:
+        runner._read_source_at_ref("708", commit)
+    assert unavailable.value.failure_type == "remote_commit_absent"
+    assert calls == [f"repos/davetwchiu/david-knowledge-vault/git/commits/{commit}",
+                     "repos/davetwchiu/david-knowledge-vault/"]
+
+    def hidden_repository(_method, endpoint, **_kwargs):
+        raise runner.GitHubApiError("GET", endpoint, status=404)
+    monkeypatch.setattr(runner, "_github_api", hidden_repository)
+    with pytest.raises(runner.StageBlocked, match="remote_commit_unavailable") as hidden:
+        runner._read_source_at_ref("708", commit)
+    assert hidden.value.failure_type == "remote_commit_unavailable"
+    assert hidden.value.retryable is True
+
+
 def test_real_receipt_validator_checks_matching_ledger_and_curated_target(monkeypatch):
     identity = {"logical_id": "gooaye:exact"}
+    source_raw = b"Episode identity: `gooaye:exact`"
+    source_blob = runner.hashlib.sha1(
+        b"blob " + str(len(source_raw)).encode() + b"\0" + source_raw).hexdigest()
     material = {"path": "00 Inbox/Gooaye Podcast/EP721.md", "base_sha": "b" * 40,
-                "head_sha": "c" * 40, "blob_sha": "d" * 40}
+                "head_sha": "c" * 40, "blob_sha": source_blob}
     publication = {"source_path": material["path"], "base_sha": material["base_sha"],
                    "head_sha": material["head_sha"], "blob_sha": material["blob_sha"],
                    "ingestion_identity": "vault-ingest:" + material["head_sha"]}
@@ -721,9 +901,11 @@ def test_real_receipt_validator_checks_matching_ledger_and_curated_target(monkey
     vault_state = {"items": {material["path"] + "#" + material["blob_sha"]: receipt}}
     def content(raw, sha):
         return {"sha": sha, "encoding": "base64", "content": runner.base64.b64encode(raw).decode()}
-    source = content(b"Episode identity: `gooaye:exact`", material["blob_sha"])
+    source = content(source_raw, material["blob_sha"])
     target_content = content(b"curated note", "e" * 40)
+    api_calls = []
     def api(method, endpoint, **kwargs):
+        api_calls.append((method, endpoint))
         assert method == "GET"
         if "/pulls/600" in endpoint:
             return {"state": "closed", "merged": True, "merge_commit_sha": "f" * 40,
@@ -747,6 +929,11 @@ def test_real_receipt_validator_checks_matching_ledger_and_curated_target(monkey
     assert result["receipt_result"] == "processed"
     assert result["curation_result"] == "created"
     assert result["target_readback"] == {target: "e" * 40}
+    source["content"] = runner.base64.b64encode(b"changed bytes").decode()
+    with pytest.raises(runner.StageBlocked, match="source_blob_mismatch"):
+        runner._verified_trusted_receipt("721", identity, publication)
+    assert all(method == "GET" for method, _ in api_calls)
+    source["content"] = runner.base64.b64encode(source_raw).decode()
     receipt["blob_sha"] = "9" * 40
     with pytest.raises(runner.StageBlocked, match="does not match|mismatch"):
         runner._verified_trusted_receipt("721", identity, publication)

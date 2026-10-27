@@ -155,6 +155,7 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
+    agent._trusted_runner_outcome = None
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
     if getattr(agent, "_incremental_persistence_failed", False):
@@ -163,6 +164,21 @@ def run_tool_round(
         _turn_exit_reason = "session_persistence_failed"
         final_response = ""
         failed = True
+        return _verdict("break")
+
+    runner_outcome = getattr(agent, "_trusted_runner_outcome", None)
+    if runner_outcome is not None:
+        agent._trusted_runner_outcome = None
+        final_response = runner_outcome["final_response"]
+        _turn_exit_reason = "text_response(trusted_runner)"
+        append_message(messages, {"role": "assistant", "content": final_response})
+        agent._session_messages = messages
+        if final_response and final_response != "[SILENT]":
+            agent._safe_print(f"\n{final_response}\n")
+            if agent.stream_delta_callback:
+                with suppress(Exception):
+                    agent.stream_delta_callback(final_response)
+                    agent.stream_delta_callback(None)
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is None and getattr(agent, "_outcome_followthrough_pending", False):

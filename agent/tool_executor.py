@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_result_classification import trusted_gooaye_cycle_outcome
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -1058,6 +1059,10 @@ def _commit_tool_result(
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
+    if observed and not blocked:
+        outcome = trusted_gooaye_cycle_outcome(function_name, function_args, function_result)
+        if outcome is not None:
+            agent._trusted_runner_outcome = outcome
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(
@@ -1799,11 +1804,21 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
-    for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
+    runs = list(terminal_approval_runs(agent, assistant_message.tool_calls))
+    for run_index, calls in enumerate(runs):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
             _execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, effective_task_id, api_call_count, finalize=False)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_trusted_runner_outcome", None) is not None:
+            remaining = [tc for run in runs[run_index + 1:] for tc in run]
+            if remaining and not _append_skipped_tool_results(
+                agent, messages, remaining, effective_task_id,
+                content="[Tool execution skipped — {name} was not started after the deterministic job runner returned]",
+                flush_stage="trusted runner skipped tool result",
+            ):
+                return
+            break
     if finalize:
         _finalize_tool_batch(agent, messages, effective_task_id, len(assistant_message.tool_calls), _budget_for_agent(agent))
 
@@ -1852,6 +1867,15 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
                                           budget=_tool_budget, transform_applied=dispatch.transform_applied):
             return
 
+        if getattr(agent, "_trusted_runner_outcome", None) is not None:
+            if i < len(tool_calls) and not _append_skipped_tool_results(
+                agent, messages, tool_calls[i:], effective_task_id,
+                content="[Tool execution skipped — {name} was not started after the deterministic job runner returned]",
+                flush_stage="trusted runner skipped tool result",
+            ):
+                return
+            break
+
         if agent._interrupt_requested and i < len(tool_calls):
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i:], effective_task_id,
@@ -1879,7 +1903,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -1887,6 +1911,15 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         run_segment(agent, segment_message, messages, effective_task_id, api_call_count, finalize=False)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_trusted_runner_outcome", None) is not None:
+            remaining = [tc for _, later_calls in segments[segment_index + 1:] for tc in later_calls]
+            if remaining and not _append_skipped_tool_results(
+                agent, messages, remaining, effective_task_id,
+                content="[Tool execution skipped — {name} was not started after the deterministic job runner returned]",
+                flush_stage="trusted runner skipped tool result",
+            ):
+                return
+            break
 
     total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:

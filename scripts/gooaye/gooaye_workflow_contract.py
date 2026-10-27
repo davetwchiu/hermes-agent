@@ -242,17 +242,45 @@ def start_stage(
     return result
 
 
+def record_blocker(
+    state: dict[str, Any], stage: str, reason: str, *, failure_type: str = "unknown",
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist a task-specific blocker fingerprint beside its exact precondition evidence."""
+    result = _copy_state(state)
+    record = result["stages"].get(stage)
+    if record is None or record["status"] not in {"running", "outcome_unknown", "failed"}:
+        raise WorkflowContractError(f"stage {stage} has no active or blocked operation")
+    reason = _text(reason, "failure reason")
+    evidence = copy.deepcopy(evidence or {})
+    fingerprint = {
+        "logical_id": result["identity"]["logical_id"],
+        "stage": stage,
+        "operation_id": record.get("operation_id"),
+        "failure_type": _text(failure_type, "failure_type"),
+        "reason": reason,
+        "evidence": evidence,
+    }
+    record.update(
+        failure_reason=reason,
+        failure_type=fingerprint["failure_type"],
+        blocker_evidence=evidence,
+        blocker_fingerprint=hashlib.sha256(_canonical(fingerprint).encode()).hexdigest(),
+    )
+    return result
+
+
 def fail_stage(
-    state: dict[str, Any], stage: str, reason: str, *, retryable: bool = True
+    state: dict[str, Any], stage: str, reason: str, *, retryable: bool = True,
+    failure_type: str = "unknown", evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = _copy_state(state)
     record = result["stages"].get(stage)
     if record is None or record["status"] != "running":
         raise WorkflowContractError(f"stage {stage} must be running before failure")
     record["status"] = "failed"
-    record["failure_reason"] = _text(reason, "failure reason")
     record["retryable"] = bool(retryable)
-    return result
+    return record_blocker(result, stage, reason, failure_type=failure_type, evidence=evidence)
 
 
 def complete_stage(
@@ -277,6 +305,8 @@ def complete_stage(
     if record.get("expected_hash") and artifact_hash != record["expected_hash"]:
         raise IdentityConflict(f"{stage} artifact hash differs from the recorded expectation")
     record["status"] = "completed"
+    for key in ("failure_reason", "failure_type", "blocker_evidence", "blocker_fingerprint", "retryable"):
+        record.pop(key, None)
     if artifact_hash is not None:
         record["artifact_hash"] = _text(artifact_hash, "artifact_hash")
     if external_id is not None:
@@ -300,11 +330,13 @@ def reconcile_receipt(
     stage: str,
     receipt: dict[str, Any],
 ) -> dict[str, Any]:
-    """Converge an uncertain external call only on an exact trusted receipt."""
+    """Converge an uncertain or blocked operation only on its exact trusted receipt."""
     result = _copy_state(state)
     record = result["stages"].get(stage)
-    if record is None or record["status"] not in {"running", "outcome_unknown"}:
-        raise WorkflowContractError(f"stage {stage} has no uncertain operation")
+    blocked_recheck = (record is not None and record["status"] == "failed"
+                       and record.get("retryable") is False and record.get("blocker_fingerprint"))
+    if record is None or (record["status"] not in {"running", "outcome_unknown"} and not blocked_recheck):
+        raise WorkflowContractError(f"stage {stage} has no uncertain or fingerprinted blocked operation")
     if receipt.get("logical_id") != result["identity"].get("logical_id"):
         raise ReceiptConflict("receipt logical_id does not match episode identity")
     if not record.get("operation_id"):
@@ -319,6 +351,9 @@ def reconcile_receipt(
     record["external_id"] = _text(receipt.get("external_id"), "receipt external_id")
     record["receipt_id"] = _text(receipt.get("receipt_id"), "receipt_id")
     record["content_hash"] = _text(receipt.get("content_hash"), "receipt content_hash")
+    for key in ("failure_reason", "failure_type", "blocker_evidence", "blocker_fingerprint",
+                "retryable", "absence_proof"):
+        record.pop(key, None)
     return result
 
 
@@ -328,13 +363,16 @@ def requeue_after_confirmed_absence(
     """Allow a retry only after the existing publisher proves no write exists."""
     result = _copy_state(state)
     record = result["stages"].get(stage)
-    if record is None or record["status"] != "outcome_unknown":
-        raise WorkflowContractError(f"stage {stage} is not outcome-unknown")
+    blocked_recheck = (record is not None and record["status"] == "failed"
+                       and record.get("retryable") is False and record.get("blocker_fingerprint"))
+    if record is None or (record["status"] != "outcome_unknown" and not blocked_recheck):
+        raise WorkflowContractError(f"stage {stage} has no uncertain or fingerprinted blocked operation")
     proof = _text(proof, "absence proof")
     record["status"] = "pending"
     record["absence_proof"] = proof
-    record.pop("attempt_id", None)
-    record.pop("operation_id", None)
+    for key in ("attempt_id", "operation_id", "failure_reason", "failure_type",
+                "blocker_evidence", "blocker_fingerprint", "retryable"):
+        record.pop(key, None)
     return result
 
 
