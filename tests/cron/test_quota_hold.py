@@ -1,12 +1,12 @@
 """Provider quota windows park a cron job instead of re-firing into them (#89376).
 
-Contract (cron/quota_hold.py): a failed run whose cause is a rate-limited ``AuthError`` with a
-``retry after <N>s`` hint parks a recurring job's ``next_run_at`` past the window and stamps
-``quota_hold_until``; the stale-error re-arm leaves a held job alone; a run that reaches the
-model clears the marker. The hint is read only from the AuthError in the cause chain, never from
-arbitrary failure text.
+Contract (cron/quota_hold.py): a failed run with a typed provider reset parks a recurring job's
+``next_run_at`` past the window and stamps ``quota_hold_until``; the stale-error re-arm leaves a
+held job alone; a run that reaches the model clears the marker. The hint comes only from a typed
+``AuthError`` or structured agent failure result, never arbitrary failure text.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +49,23 @@ def test_hold_seconds_only_from_rate_limited_auth_error_in_cause_chain():
     assert qh.hold_seconds_from_failure(relogin) is None
     structured = AuthError("quota", code=CODEX_RATE_LIMITED_CODE, retry_after=900)
     assert qh.hold_seconds_from_failure(structured) == 900.0
+
+
+def test_agent_rate_limit_result_keeps_explicit_reset_for_quota_hold():
+    reset_at = time.time() + 900
+    result = {
+        "failed": True, "completed": False, "error": "HTTP 429: usage limit",
+        "failure_reason": "rate_limit", "failure_retryable": True,
+        "failure_resets_at": reset_at,
+    }
+    with pytest.raises(qh.AgentRateLimitFailure) as failure:
+        sched._final_response_from_result(result, "job1", "test job", object)
+    assert qh.hold_seconds_from_failure(failure.value) == pytest.approx(900, abs=2)
+
+    result["failure_resets_at"] = None
+    with pytest.raises(RuntimeError) as untyped:
+        sched._final_response_from_result(result, "job1", "test job", object)
+    assert qh.hold_seconds_from_failure(untyped.value) is None
 
 
 def _raise_quota(**_kw):
