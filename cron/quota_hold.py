@@ -15,6 +15,7 @@ it LATER. Any run that reaches the model clears the marker.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -33,17 +34,31 @@ HOLD_SLACK_SECONDS = 60
 _RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
 
 
+class AgentRateLimitFailure(RuntimeError):
+    """Typed bridge for a failed agent result with an explicit provider reset time."""
+
+    def __init__(self, message: str, *, retry_after: float):
+        self.retry_after = float(retry_after)
+        if not math.isfinite(self.retry_after) or self.retry_after <= 0:
+            raise ValueError("provider retry_after must be finite and positive")
+        super().__init__(message)
+
+
 def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
-    """Seconds the provider said it will stay closed, or None when *exc* (or anything in its
-    cause chain) is not a rate-limited ``AuthError`` carrying a wait hint. Anchored on the
-    AuthError itself, never on arbitrary text, so an unrelated "retry after" in an agent's
-    output cannot park a job."""
+    """Seconds until a typed provider reset, or None when there is no trusted wait hint.
+
+    Auth failures use their typed ``AuthError`` cause. Agent API failures cross the structured
+    ``run_conversation`` result boundary through ``AgentRateLimitFailure``. Arbitrary text never
+    parks a job.
+    """
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     seen: set[int] = set()
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        if isinstance(cur, AgentRateLimitFailure):
+            return cur.retry_after if math.isfinite(cur.retry_after) and cur.retry_after > 0 else None
         if isinstance(cur, AuthError) and is_rate_limited_auth_error(cur):
             hint = getattr(cur, "retry_after", None)
             if hint is None:

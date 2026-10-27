@@ -9,6 +9,7 @@ import contextvars
 import errno
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -1986,7 +1987,16 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        error = result.get("error") or final_response_text or "agent reported failure"
+        reset_at = result.get("failure_resets_at")
+        if (result.get("failure_reason") in {"rate_limit", "upstream_rate_limit"}
+                and result.get("failure_retryable") is True
+                and type(reset_at) in (int, float) and math.isfinite(float(reset_at))):
+            retry_after = float(reset_at) - time.time()
+            if retry_after > 0:
+                from cron.quota_hold import AgentRateLimitFailure
+                raise AgentRateLimitFailure(str(error), retry_after=retry_after)
+        raise RuntimeError(error)
     if max_iteration_summary:
         logger.warning(
             "Job '%s' reached the iteration limit but produced a final fallback response; "
